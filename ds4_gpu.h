@@ -3280,9 +3280,11 @@ int ds4_gpu_qwen38_gdn(
         uint32_t              n_tokens,
         float                 norm_eps);
 
-/* Qwen 3.8 QSA dense-attention layer pass (exact up to the 2048-token
- * indexer budget): in-place q norm+RoPE, f16 KV append, causal GQA
- * attention with the fused sigmoid output gate. */
+/* Qwen 3.8 QSA attention layer pass: in-place q norm+RoPE, f16 KV append,
+ * causal GQA attention with the fused sigmoid output gate. With mask_words 0
+ * every row walks its whole prefix (exact up to the 2048-token indexer
+ * budget); otherwise the walk skips positions whose bit is clear in the
+ * row's mask (mask_words uint32 per row), in the same position order. */
 int ds4_gpu_qwen38_qsa(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *k_cache,
@@ -3303,7 +3305,47 @@ int ds4_gpu_qwen38_qsa(
         uint32_t              pos0,
         uint32_t              cache_cap,
         float                 rope_freq_base,
+        float                 norm_eps,
+        const ds4_gpu_tensor *sel_mask,
+        uint32_t              mask_words);
+
+/* Qwen 3.8 indexer key side: append raw indexer keys to the per-token cache,
+ * rebuild the pooled (mean of 4, RMSNorm, RoPE at block start) rows of every
+ * complete block this pass touches, and when q is non-NULL normalize and
+ * rotate the indexer queries in place. Scores, top-k and block expansion then
+ * go through the GLM 5.3 indexer entry points, which share the semantics. */
+int ds4_gpu_qwen38_indexer_keys(
+        ds4_gpu_tensor       *raw_cache,
+        ds4_gpu_tensor       *pool_cache,
+        ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              head_dim,
+        uint32_t              rope_dim,
+        uint32_t              n_rows,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              pool_size,
+        float                 rope_freq_base,
         float                 norm_eps);
+
+/* Qwen 3.8 block selection to per-row position masks (n_rows x mask_words
+ * uint32, one bit per position, zeroed by the caller): the tokens of the
+ * selected blocks that are complete for the row, then its incomplete tail
+ * block. */
+int ds4_gpu_qwen38_indexer_expand(
+        ds4_gpu_tensor       *sel_mask,
+        const ds4_gpu_tensor *pool_selected,
+        uint32_t              n_rows,
+        uint32_t              pos0,
+        uint32_t              top_k,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              mask_words);
 
 /* Qwen 3.8 lowrank gated-residual (hyper-connection) and PLE primitives.
  * The lowrank/inject projections themselves run through the ordinary dense

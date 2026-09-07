@@ -141,10 +141,13 @@ n-gram embeddings from the sidecar.
 
 Know the limits before using it:
 
-* **Context beyond about 2048 tokens diverges from the official model.** The
-  QSA layers run dense attention, which matches the model exactly only while
-  its own indexer would select every block, that is up to the 2048-token
-  indexer budget. The block indexer is not implemented.
+* The QSA block indexer is implemented: each query attends to its top-512
+  pooled key blocks plus the incomplete tail, as in the reference. Up to the
+  2048-token budget every block is selected, so the engine uses the plain
+  dense walk there; `DS4_QWEN38_FORCE_INDEXER=1` forces the sparse path
+  regardless, which is the equivalence check (the two are bit-identical).
+  Beyond the budget the dense path is not an option at all: the model
+  collapses without its indexer.
 * SSD streaming, `--kv-disk-dir` and `--batched-session` are refused for this
   model: serializing the recurrent and PLE session state is not written yet.
 * No MTP, no vision.

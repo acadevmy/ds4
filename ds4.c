@@ -42263,6 +42263,17 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *q38_ple_conv_state;
     ds4_gpu_tensor *layer_q38_k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_q38_v_cache[DS4_MAX_LAYER];
+    /* QSA indexer: raw 128-wide keys per token and the pooled row of every
+     * complete 4-token block, both f16, per attention layer. The batch
+     * scratch is sized for batch_cap query rows against ctx_cap / 4 blocks. */
+    ds4_gpu_tensor *layer_q38_idx_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_q38_idx_pool[DS4_MAX_LAYER];
+    ds4_gpu_tensor *q38_idx_q;        /* rows x 4 heads x 128 */
+    ds4_gpu_tensor *q38_idx_k;        /* rows x 128 */
+    ds4_gpu_tensor *q38_idx_ones;     /* rows x 4: the score kernel's head weights */
+    ds4_gpu_tensor *q38_idx_scores;   /* rows x blocks */
+    ds4_gpu_tensor *q38_idx_pool_sel; /* rows x 512 selected blocks */
+    ds4_gpu_tensor *q38_idx_sel;      /* rows x ctx_cap bits: selected positions */
     ds4_qwen38_ple_ctx q38_ple_ctx;
     /* The gather advances this copy; it is promoted to q38_ple_ctx only when
      * the forward as a whole succeeded, so a failed chunk cannot leave the
@@ -49563,6 +49574,18 @@ static void qwen38_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->q38_ple_gated);
     ds4_gpu_tensor_free(g->q38_ple_gnorm);
     ds4_gpu_tensor_free(g->q38_ple_conv_state);
+    ds4_gpu_tensor_free(g->q38_idx_q);
+    ds4_gpu_tensor_free(g->q38_idx_k);
+    ds4_gpu_tensor_free(g->q38_idx_ones);
+    ds4_gpu_tensor_free(g->q38_idx_scores);
+    ds4_gpu_tensor_free(g->q38_idx_pool_sel);
+    ds4_gpu_tensor_free(g->q38_idx_sel);
+    g->q38_idx_q = NULL;
+    g->q38_idx_k = NULL;
+    g->q38_idx_ones = NULL;
+    g->q38_idx_scores = NULL;
+    g->q38_idx_pool_sel = NULL;
+    g->q38_idx_sel = NULL;
     g->q38_h = NULL;
     g->q38_normed = NULL;
     g->q38_low = NULL;
@@ -49581,8 +49604,12 @@ static void qwen38_graph_free(ds4_glm_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_q38_k_cache[il]);
         ds4_gpu_tensor_free(g->layer_q38_v_cache[il]);
+        ds4_gpu_tensor_free(g->layer_q38_idx_raw[il]);
+        ds4_gpu_tensor_free(g->layer_q38_idx_pool[il]);
         g->layer_q38_k_cache[il] = NULL;
         g->layer_q38_v_cache[il] = NULL;
+        g->layer_q38_idx_raw[il] = NULL;
+        g->layer_q38_idx_pool[il] = NULL;
     }
     free(g->q38_stage_host);
     g->q38_stage_host = NULL;
@@ -49740,6 +49767,25 @@ static bool qwen38_graph_alloc_slice(
         (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM;
     const uint64_t kv_elems =
         (uint64_t)g->ctx_cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    /* Pool size is fixed at 4 by the shared GLM 5.3 indexer entry points. */
+    const uint64_t idx_blocks = (uint64_t)g->ctx_cap / DS4_GLM53_INDEX_POOL_SIZE;
+    const uint64_t idx_mask_words = ((uint64_t)g->ctx_cap + 31u) / 32u;
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_q,
+                               rows * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM *
+                               sizeof(float));
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_k,
+                               rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_ones,
+                               rows * DS4_N_INDEXER_HEAD * sizeof(float));
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_scores, rows * idx_blocks * sizeof(float));
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_pool_sel,
+                               rows * (DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE) *
+                               sizeof(uint32_t));
+    DS4_QWEN38_ALLOC_TENSOR(g->q38_idx_sel, rows * idx_mask_words * sizeof(uint32_t));
+    /* The reference sums ReLU(q.k) over the four heads with no per-head
+     * weight; the shared score kernel wants one per (row, head). */
+    if (ok) ok = ds4_gpu_tensor_fill_f32(g->q38_idx_ones, 1.0f,
+                                         rows * DS4_N_INDEXER_HEAD) != 0;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_layer_is_linear_attn(il)) {
             DS4_QWEN38_ALLOC_TENSOR(g->layer_kda_conv_state[il],
@@ -49751,6 +49797,12 @@ static bool qwen38_graph_alloc_slice(
                                        kv_elems * sizeof(uint16_t));
             DS4_QWEN38_ALLOC_TENSOR(g->layer_q38_v_cache[il],
                                        kv_elems * sizeof(uint16_t));
+            DS4_QWEN38_ALLOC_TENSOR(g->layer_q38_idx_raw[il],
+                                       (uint64_t)g->ctx_cap * DS4_N_INDEXER_HEAD_DIM *
+                                       sizeof(uint16_t));
+            DS4_QWEN38_ALLOC_TENSOR(g->layer_q38_idx_pool[il],
+                                       idx_blocks * DS4_N_INDEXER_HEAD_DIM *
+                                       sizeof(uint16_t));
         }
     }
     g->q38_stage_host = malloc(rows * wide * sizeof(float));
@@ -50036,6 +50088,59 @@ static bool qwen38_graph_forward_tokens(
             if (ok) ok = glm53_graph_matmul_rows(g->kda_v, model, l->qsa_v,
                                                  DS4_N_EMBD, kv_dim,
                                                  g->q38_mixed, rows);
+            /* Indexer. Raw keys are cached and pooled on every pass so the
+             * selection can start the moment the prefix outgrows the budget.
+             * Below it every block would be selected anyway, so the dense
+             * walk is used and the query side is skipped; the environment
+             * switch forces the sparse path for the equivalence check. */
+            bool sparse = pos0 + rows > DS4_N_INDEXER_TOP_K ||
+                          getenv("DS4_QWEN38_FORCE_INDEXER") != NULL;
+            const uint32_t mask_words = (g->ctx_cap + 31u) / 32u;
+            if (ok) ok = glm53_graph_matmul_rows(g->q38_idx_k, model,
+                                                 l->qsa_idx_k, DS4_N_EMBD,
+                                                 DS4_N_INDEXER_HEAD_DIM,
+                                                 g->q38_mixed, rows);
+            if (ok && sparse) {
+                ok = glm53_graph_matmul_rows(g->q38_idx_q, model, l->qsa_idx_q,
+                                             DS4_N_EMBD,
+                                             DS4_N_INDEXER_HEAD *
+                                             DS4_N_INDEXER_HEAD_DIM,
+                                             g->q38_mixed, rows);
+            }
+            if (ok) ok = ds4_gpu_qwen38_indexer_keys(
+                g->layer_q38_idx_raw[il], g->layer_q38_idx_pool[il],
+                sparse ? g->q38_idx_q : NULL, g->q38_idx_k,
+                model->map, model->size,
+                l->qsa_idx_q_norm->abs_offset, l->qsa_idx_k_norm->abs_offset,
+                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, rows,
+                pos0, g->ctx_cap, DS4_GLM53_INDEX_POOL_SIZE,
+                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
+            if (ok && sparse) {
+                const uint32_t blocks = (pos0 + rows) / DS4_GLM53_INDEX_POOL_SIZE;
+                const uint32_t block_top_k =
+                    DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE;
+                const uint32_t top_k = blocks < block_top_k ? blocks : block_top_k;
+                if (top_k == 0) {
+                    sparse = false; /* nothing but the tail: the dense walk is it */
+                } else {
+                    ok = ds4_gpu_glm53_indexer_scores_batch_tensor(
+                        g->q38_idx_scores, g->q38_idx_q, g->q38_idx_ones,
+                        g->layer_q38_idx_pool[il], blocks, rows, pos0,
+                        DS4_GLM53_INDEX_POOL_SIZE, DS4_N_INDEXER_HEAD,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        1.0f / sqrtf((float)DS4_N_INDEXER_HEAD_DIM), true) != 0;
+                    if (ok) ok = ds4_gpu_indexer_topk_tensor(
+                        g->q38_idx_pool_sel, g->q38_idx_scores, blocks, rows,
+                        top_k) != 0;
+                    if (ok) ok = ds4_gpu_tensor_fill_f32(
+                        g->q38_idx_sel, 0.0f, (uint64_t)rows * mask_words) != 0;
+                    if (ok) ok = ds4_gpu_qwen38_indexer_expand(
+                        g->q38_idx_sel, g->q38_idx_pool_sel, rows, pos0, top_k,
+                        DS4_N_INDEXER_TOP_K, DS4_GLM53_INDEX_POOL_SIZE,
+                        mask_words) != 0;
+                }
+            }
+            if (!ok) DS4_Q38_STEP("qsa indexer");
             if (ok) ok = ds4_gpu_qwen38_qsa(
                 g->kda_out, g->layer_q38_k_cache[il],
                 g->layer_q38_v_cache[il], g->kda_q, g->kda_output_gate,
@@ -50043,7 +50148,8 @@ static bool qwen38_graph_forward_tokens(
                 l->qsa_q_norm->abs_offset, l->qsa_k_norm->abs_offset,
                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                 rows, pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE,
-                DS4_RMS_EPS) != 0;
+                DS4_RMS_EPS, sparse ? g->q38_idx_sel : NULL,
+                sparse ? mask_words : 0u) != 0;
             if (ok) ok = glm53_graph_matmul_rows(g->q38_block_out, model,
                                                  l->attn_output, q_dim,
                                                  DS4_N_EMBD, g->kda_out, rows);

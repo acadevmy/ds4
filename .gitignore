@@ -60,4 +60,5 @@ __pycache__/
 /tests/test_qwen38_hc
 /tests/test_qwen38_ple_hash
 /tests/test_qwen38_ple_store
+/tests/test_qwen38_indexer
 /tests/test_qwen38_qsa

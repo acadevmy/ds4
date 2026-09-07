@@ -47440,10 +47440,32 @@ typedef struct {
     uint32_t n_rows;
     uint32_t pos0;
     uint32_t cache_cap;
+    uint32_t mask_words;
     float rope_freq_base;
     float norm_eps;
     float attn_scale;
 } qwen38_gpu_qsa_args;
+
+typedef struct {
+    uint32_t n_heads;
+    uint32_t head_dim;
+    uint32_t rope_dim;
+    uint32_t n_rows;
+    uint32_t pos0;
+    uint32_t cache_cap;
+    uint32_t pool_size;
+    float rope_freq_base;
+    float norm_eps;
+} qwen38_gpu_indexer_args;
+
+typedef struct {
+    uint32_t n_rows;
+    uint32_t pos0;
+    uint32_t top_k;
+    uint32_t index_topk;
+    uint32_t pool_size;
+    uint32_t mask_words;
+} qwen38_gpu_indexer_expand_args;
 
 /*
  * Qwen 3.8 QSA dense-attention layer pass (bring-up path, exact up to the
@@ -47472,7 +47494,9 @@ int ds4_gpu_qwen38_qsa(
         uint32_t              pos0,
         uint32_t              cache_cap,
         float                 rope_freq_base,
-        float                 norm_eps) {
+        float                 norm_eps,
+        const ds4_gpu_tensor *sel_mask,
+        uint32_t              mask_words) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n_q_heads == 0 || n_kv_heads == 0 || n_rows == 0 ||
         n_q_heads % n_kv_heads != 0 ||
@@ -47498,7 +47522,11 @@ int ds4_gpu_qwen38_qsa(
         !glm53_gpu_tensor_has(v, kv_activation, sizeof(float)) ||
         !glm53_gpu_tensor_has(out, out_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(k_cache, cache_elements, sizeof(uint16_t)) ||
-        !glm53_gpu_tensor_has(v_cache, cache_elements, sizeof(uint16_t))) {
+        !glm53_gpu_tensor_has(v_cache, cache_elements, sizeof(uint16_t)) ||
+        (mask_words != 0 &&
+         (mask_words < (pos0 + n_rows + 31u) / 32u ||
+          !glm53_gpu_tensor_has(sel_mask, (uint64_t)mask_words * n_rows,
+                                sizeof(uint32_t))))) {
         fprintf(stderr, "ds4: Qwen38 QSA received invalid buffers\n");
         return 0;
     }
@@ -47531,10 +47559,14 @@ int ds4_gpu_qwen38_qsa(
             .n_rows = n_rows,
             .pos0 = pos0,
             .cache_cap = cache_cap,
+            .mask_words = mask_words,
             .rope_freq_base = rope_freq_base,
             .norm_eps = norm_eps,
             .attn_scale = 1.0f / sqrtf((float)head_dim),
         };
+        /* The dense walk never reads the mask, but Metal wants every declared
+         * buffer bound; any valid buffer serves. */
+        const ds4_gpu_tensor *sel_bind = mask_words != 0 ? sel_mask : out;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -47578,6 +47610,8 @@ int ds4_gpu_qwen38_qsa(
                 offset:ds4_gpu_tensor_offset(v_cache) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(sel_bind)
+                offset:ds4_gpu_tensor_offset(sel_bind) atIndex:6];
         [enc setThreadgroupMemoryLength:
                 (9u * head_dim + 16u) * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_q_heads, 1)
@@ -47585,7 +47619,187 @@ int ds4_gpu_qwen38_qsa(
 
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
-            cb, owned, "Qwen38 QSA dense layer pass");
+            cb, owned, "Qwen38 QSA layer pass");
+    }
+}
+
+/*
+ * Qwen 3.8 indexer key side: append the raw 128-wide key rows to the per-token
+ * cache and rebuild the pooled, normalized, block-start-rotated rows of every
+ * complete 4-token block this pass touches. When q is non-NULL its rows
+ * (n_heads x 128) are also normalized and rotated in place, ready for the
+ * shared indexer score kernel. Scores, top-k and the block-to-token expansion
+ * reuse the GLM 5.3 entry points, which implement the same pooled selection.
+ */
+int ds4_gpu_qwen38_indexer_keys(
+        ds4_gpu_tensor       *raw_cache,
+        ds4_gpu_tensor       *pool_cache,
+        ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              head_dim,
+        uint32_t              rope_dim,
+        uint32_t              n_rows,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              pool_size,
+        float                 rope_freq_base,
+        float                 norm_eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!raw_cache || !pool_cache || !k || !model_map ||
+        n_heads == 0 || n_rows == 0 || head_dim != 128u || pool_size == 0 ||
+        rope_dim == 0 || rope_dim > head_dim || (rope_dim & 1u) != 0 ||
+        (uint64_t)pos0 + n_rows > cache_cap) {
+        fprintf(stderr, "ds4: Qwen38 indexer received invalid arguments\n");
+        return 0;
+    }
+    const uint64_t pools_cap = cache_cap / pool_size;
+    if (!glm53_gpu_tensor_has(k, (uint64_t)n_rows * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(raw_cache, (uint64_t)cache_cap * head_dim,
+                              sizeof(uint16_t)) ||
+        !glm53_gpu_tensor_has(pool_cache, pools_cap * head_dim,
+                              sizeof(uint16_t)) ||
+        (q && !glm53_gpu_tensor_has(q, (uint64_t)n_rows * n_heads * head_dim,
+                                    sizeof(float)))) {
+        fprintf(stderr, "ds4: Qwen38 indexer received invalid buffers\n");
+        return 0;
+    }
+    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    @autoreleasepool {
+        uint64_t qn_inner = 0, kn_inner = 0;
+        id<MTLBuffer> k_norm = glm53_gpu_weight_buffer(
+            model_map, model_size, k_norm_offset, norm_bytes,
+            &kn_inner, "indexer k norm");
+        id<MTLBuffer> q_norm = q ? glm53_gpu_weight_buffer(
+            model_map, model_size, q_norm_offset, norm_bytes,
+            &qn_inner, "indexer q norm") : nil;
+        id<MTLComputePipelineState> store_pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen38_indexer_store_k");
+        id<MTLComputePipelineState> pool_pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen38_indexer_pool");
+        id<MTLComputePipelineState> prep_pipeline =
+            q ? ds4_gpu_get_pipeline("kernel_qwen38_indexer_prepare_q") : nil;
+        if (!k_norm || !store_pipeline || !pool_pipeline ||
+            (q && (!q_norm || !prep_pipeline))) {
+            return 0;
+        }
+        qwen38_gpu_indexer_args args = {
+            .n_heads = n_heads,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .n_rows = n_rows,
+            .pos0 = pos0,
+            .cache_cap = cache_cap,
+            .pool_size = pool_size,
+            .rope_freq_base = rope_freq_base,
+            .norm_eps = norm_eps,
+        };
+        /* Pools overlapping [pos0, pos0 + n_rows): from the one holding pos0
+         * through the one holding the last row. */
+        const uint32_t first_pool = pos0 / pool_size;
+        const uint32_t last_pool = (pos0 + n_rows - 1u) / pool_size;
+        const NSUInteger shared_bytes =
+            (head_dim / 32u + rope_dim) * sizeof(float);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:store_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                offset:ds4_gpu_tensor_offset(k) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_cache)
+                offset:ds4_gpu_tensor_offset(raw_cache) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(head_dim, n_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        [enc setComputePipelineState:pool_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_cache)
+                offset:ds4_gpu_tensor_offset(raw_cache) atIndex:1];
+        [enc setBuffer:k_norm offset:(NSUInteger)kn_inner atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pool_cache)
+                offset:ds4_gpu_tensor_offset(pool_cache) atIndex:3];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(last_pool - first_pool + 1u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        if (q) {
+            [enc setComputePipelineState:prep_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:q_norm offset:(NSUInteger)qn_inner atIndex:2];
+            [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Qwen38 indexer key pass");
+    }
+}
+
+/*
+ * Qwen 3.8 block selection to per-row position masks (n_rows x mask_words
+ * uint32, one bit per position; the caller zeroes the mask). Only blocks
+ * complete for the row are set, then the row's incomplete tail.
+ */
+int ds4_gpu_qwen38_indexer_expand(
+        ds4_gpu_tensor       *sel_mask,
+        const ds4_gpu_tensor *pool_selected,
+        uint32_t              n_rows,
+        uint32_t              pos0,
+        uint32_t              top_k,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              mask_words) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!sel_mask || !pool_selected || n_rows == 0 || top_k == 0 ||
+        pool_size == 0 || index_topk == 0 || top_k > index_topk / pool_size ||
+        mask_words < (pos0 + n_rows + 31u) / 32u) {
+        fprintf(stderr, "ds4: Qwen38 indexer expansion received invalid arguments\n");
+        return 0;
+    }
+    if (!glm53_gpu_tensor_has(pool_selected, (uint64_t)n_rows * top_k,
+                              sizeof(uint32_t)) ||
+        !glm53_gpu_tensor_has(sel_mask, (uint64_t)n_rows * mask_words,
+                              sizeof(uint32_t))) {
+        fprintf(stderr, "ds4: Qwen38 indexer expansion received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen38_indexer_expand");
+        if (!pipeline) return 0;
+        qwen38_gpu_indexer_expand_args args = {
+            .n_rows = n_rows,
+            .pos0 = pos0,
+            .top_k = top_k,
+            .index_topk = index_topk,
+            .pool_size = pool_size,
+            .mask_words = mask_words,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pool_selected)
+                offset:ds4_gpu_tensor_offset(pool_selected) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(sel_mask)
+                offset:ds4_gpu_tensor_offset(sel_mask) atIndex:2];
+        const uint64_t total = (uint64_t)n_rows * (index_topk + pool_size - 1u);
+        NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Qwen38 indexer expansion");
     }
 }
 

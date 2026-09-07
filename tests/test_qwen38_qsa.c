@@ -191,7 +191,7 @@ int main(void) {
         out, k_cache, v_cache, q, og, k, v,
         model, MODEL_BYTES, Q_NORM_OFFSET, K_NORM_OFFSET,
         Q_HEADS, KV_HEADS, D, ROPE, TOKENS, 0, CACHE_CAP,
-        FREQ_BASE, NORM_EPS), "QSA batch pass");
+        FREQ_BASE, NORM_EPS, NULL, 0), "QSA batch pass");
     static float batch_actual[TOKENS * OUT_ROW];
     require_ok(ds4_gpu_tensor_read(out, 0, batch_actual, sizeof(batch_actual)),
                "batch output read");
@@ -217,7 +217,7 @@ int main(void) {
             out, k_cache, v_cache, q, og, k, v,
             model, MODEL_BYTES, Q_NORM_OFFSET, K_NORM_OFFSET,
             Q_HEADS, KV_HEADS, D, ROPE, 1, t, CACHE_CAP,
-            FREQ_BASE, NORM_EPS), "QSA single-token pass");
+            FREQ_BASE, NORM_EPS, NULL, 0), "QSA single-token pass");
         static float step_actual[OUT_ROW];
         require_ok(ds4_gpu_tensor_read(out, 0, step_actual, sizeof(step_actual)),
                    "step output read");
@@ -240,7 +240,7 @@ int main(void) {
         out, k_cache, v_cache, q, og, k, v,
         model, MODEL_BYTES, Q_NORM_OFFSET, K_NORM_OFFSET,
         Q_HEADS, KV_HEADS, D, ROPE, CHUNK, 0, CACHE_CAP,
-        FREQ_BASE, NORM_EPS), "QSA chunk 1");
+        FREQ_BASE, NORM_EPS, NULL, 0), "QSA chunk 1");
     require_ok(ds4_gpu_tensor_write(q, 0, qs + CHUNK * Q_ROW,
         (TOKENS - CHUNK) * Q_ROW * sizeof(float)), "chunk2 Q write");
     require_ok(ds4_gpu_tensor_write(og, 0, gs + CHUNK * Q_ROW,
@@ -253,7 +253,7 @@ int main(void) {
         out, k_cache, v_cache, q, og, k, v,
         model, MODEL_BYTES, Q_NORM_OFFSET, K_NORM_OFFSET,
         Q_HEADS, KV_HEADS, D, ROPE, TOKENS - CHUNK, CHUNK, CACHE_CAP,
-        FREQ_BASE, NORM_EPS), "QSA chunk 2");
+        FREQ_BASE, NORM_EPS, NULL, 0), "QSA chunk 2");
     static float chunk_actual[(TOKENS - CHUNK) * OUT_ROW];
     require_ok(ds4_gpu_tensor_read(out, 0, chunk_actual, sizeof(chunk_actual)),
                "chunk output read");
