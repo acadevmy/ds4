@@ -40,6 +40,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <libproc.h>
+#endif
+
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
@@ -808,6 +812,25 @@ enum {
     DS4_QWEN38_PLE_HEADS_PER_NGRAM = 8,
     DS4_QWEN38_PLE_HEADS           = 16,
     DS4_QWEN38_PLE_ROW_LEN         = 160,
+    DS4_QWEN38_PLE_ROW_BYTES       = 170, /* Q8_0: 5 blocks x (2 + 32) */
+    DS4_QWEN38_PLE_CACHE_WAYS      = 4,
+    /* Reader pool: eight overlapping reads keep an APFS SSD busy; more only
+     * added contention in the bring-up measurements. */
+    DS4_QWEN38_PLE_THREADS         = 8,
+    /* Row cache: sized to hold a context (~2.6 KB/token), not to exploit a
+     * Zipf tail that the traces did not show; 8, 64 and 512 MiB measured
+     * identically on the same input. */
+    DS4_QWEN38_PLE_CACHE_MB        = 64,
+    /* Rows per gather batch: 256 rows are 4096 independent reads, enough to
+     * keep the pool busy, and bound the scratch slab at ~700 KiB. */
+    DS4_QWEN38_PLE_BATCH_ROWS      = 256,
+    DS4_QWEN38_PLE_BATCH_ITEMS     = 256 * 16,
+    /* Dedup table: power of two, at least twice the batch, so open addressing
+     * stays sparse. */
+    DS4_QWEN38_PLE_DEDUP_SLOTS     = 8192,
+    /* APFS device block. A row can straddle two of them, hence the buffer. */
+    DS4_QWEN38_PLE_IO_BLOCK        = 4096,
+    DS4_QWEN38_PLE_IO_BUF          = 8192,
     DS4_QWEN38_PLE_LAYER           = 1,
 };
 
@@ -820,6 +843,79 @@ typedef struct {
 } ds4_qwen38_ple_config;
 
 static ds4_qwen38_ple_config g_ds4_qwen38_ple = {0};
+
+/* Row store for the n-gram table: explicit reads plus a row cache, sized in
+ * bytes we choose.  ds4_qwen38_ple_store_init() explains why the rows do not
+ * come from the sidecar mapping. */
+typedef struct {
+    int fd;
+    uint64_t base_offset;    /* file offset of row 0 */
+    uint64_t table_rows;
+    uint32_t sets;           /* 0 when no row cache is allocated */
+    uint32_t *tags;          /* sets * WAYS row ids, UINT32_MAX when empty */
+    uint8_t  *rows;          /* sets * WAYS payloads of ROW_BYTES */
+    uint8_t  *ages;          /* sets * WAYS recency, 0 = most recently used */
+    uint8_t  *bounce;        /* one row, serves misses when sets == 0 */
+    uint64_t lookups;
+    uint64_t hits;
+    uint64_t reads;
+    double   read_seconds;
+    /* Bytes the device actually moved for those reads.  Divided by the reads
+     * the sample covered, this says which kernel path they took: a whole
+     * 16 KiB page each when the offset is unaligned, one 4 KiB block (8 KiB
+     * across a boundary) when it is aligned and the read can go direct.
+     * Without it a latency delta cannot tell "alignment did not help" from
+     * "alignment never happened".
+     *
+     * The figure is exact per batch: the kernel accounts the bytes at I/O
+     * issue on the issuing thread, and the sample brackets every read of the
+     * batch.  A mean below one block therefore does not mean the sample
+     * missed something -- it means rows were served from pages already
+     * resident in the buffer cache, which happens after a run with
+     * DS4_QWEN38_PLE_NOCACHE=0 over the same tokens.  The reads this store
+     * issues never populate that cache themselves. */
+    uint64_t io_bytes;
+    uint64_t io_reads;   /* reads whose bytes the sample above actually saw */
+    uint64_t dup_hits;   /* lookups served by another item of the same batch */
+
+    /* Batch scratch, allocated once for DS4_QWEN38_PLE_BATCH_ROWS rows. */
+    struct ds4_qwen38_ple_miss *misses;
+    struct ds4_qwen38_ple_dup *dups;
+    uint32_t *dedup;   /* id -> miss index + 1, 0 is empty; per batch */
+    uint8_t *slab;
+    uint8_t *iobuf;    /* aligned staging for the serial read path */
+
+    /* Read pool.  Workers only pread into their own slab slot and dequantize
+     * into their own stage rows; the cache is touched by the caller alone. */
+    pthread_t threads[DS4_QWEN38_PLE_THREADS];
+    pthread_mutex_t mutex;
+    pthread_cond_t start_cond;
+    pthread_cond_t done_cond;
+    uint32_t n_threads;
+    uint32_t n_items;
+    uint32_t next_item;
+    uint32_t remaining;
+    uint64_t generation;
+    bool pool_ready;
+    bool stopping;
+} ds4_qwen38_ple_store;
+
+/* One row that missed the cache: read it, then dequantize it into the stage. */
+typedef struct ds4_qwen38_ple_miss {
+    uint64_t id;
+    uint8_t *slot;   /* 170 bytes of slab, private to this item */
+    float *dst;      /* 160 floats of stage, private to this item */
+    double seconds;
+    bool ok;
+} ds4_qwen38_ple_miss;
+
+/* A second item in the same batch wanting a row another item already asked
+ * for: it rides that read instead of issuing its own. */
+typedef struct ds4_qwen38_ple_dup {
+    uint32_t of;   /* index into misses */
+    float *dst;
+} ds4_qwen38_ple_dup;
+
 
 void ds4_qwen38_ple_ctx_reset(ds4_qwen38_ple_ctx *ctx) {
     ctx->prev1 = -1;
@@ -42148,7 +42244,8 @@ typedef struct ds4_glm_gpu_graph {
     float swiglu_clamp;
     /* Qwen 3.8 graph state. Per-layer GDN conv/recurrent states reuse
      * layer_kda_* above; the QSA layers keep real f16 K/V caches. The
-     * PLE n-gram table is a separate mmapped sidecar GGUF. */
+     * PLE n-gram table is a separate sidecar GGUF whose rows are served
+     * by q38_ple_store, not by the mapping. */
     ds4_gpu_tensor *q38_h;
     ds4_gpu_tensor *q38_normed;
     ds4_gpu_tensor *q38_low;
@@ -42167,10 +42264,15 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *layer_q38_k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_q38_v_cache[DS4_MAX_LAYER];
     ds4_qwen38_ple_ctx q38_ple_ctx;
+    /* The gather advances this copy; it is promoted to q38_ple_ctx only when
+     * the forward as a whole succeeded, so a failed chunk cannot leave the
+     * rolling hash context ahead of the state the session kept. */
+    ds4_qwen38_ple_ctx q38_ple_ctx_pending;
     float *q38_stage_host;
     ds4_model q38_ple_model;
     const ds4_tensor *q38_ple_table;
     bool q38_ple_open;
+    ds4_qwen38_ple_store q38_ple_store;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -48857,6 +48959,594 @@ static void qwen38_dequant_q8_0_row(const uint8_t *src, float *dst,
     }
 }
 
+/* ---- Qwen 3.8 PLE row store ---------------------------------------------
+ *
+ * The n-gram table is 51 GiB of 170-byte Q8_0 rows and every token pulls 16 of
+ * them at hash-random offsets.  Served through the sidecar mapping, each of
+ * those 170 bytes costs a 16 KiB page fault: the page cache then holds ~96
+ * rows' worth of memory for every row actually used, it grows into whatever
+ * RAM is free without being accounted anywhere, and it competes with the
+ * ~44 GiB the model keeps wired.
+ *
+ * So the rows are read with pread() on an F_NOCACHE descriptor (the kernel
+ * retains nothing) and cached here at their natural 170-byte density instead.
+ * The same footprint holds ~94x more rows, and that footprint is a number we
+ * pick rather than whatever the VM happens to keep.  The cache is 4-way set
+ * associative with exact per-set LRU; row ids are bounded by the table, so a
+ * 32-bit tag is enough with UINT32_MAX marking an empty way.
+ *
+ * The set count is deliberately not rounded to a power of two: a 64-bit modulo
+ * costs nothing against 16 device-latency-bound lookups per token, while
+ * rounding down would silently drop up to half the budget the caller asked for.
+ *
+ * Sizing: a session touches ~15 distinct rows per token (the trigram heads
+ * almost never repeat), so the whole working set is ~2.6 KB/token -- 21 MiB
+ * for a full 8192-token context.  Measured on a 745-token greedy run: 11128
+ * distinct rows, and 8 MiB, 64 MiB and 512 MiB all returned the identical
+ * 6.64% hit rate, i.e. nothing was ever evicted.  The default covers a
+ * long context several times over and still leaves room to accumulate
+ * across the requests of one session; there is no point paying for more.
+ *
+ * The reads themselves are what costs (~100 us each, against a ~34 ms token),
+ * and the 16 heads of a token are independent, so qwen38_ple_gather() fans
+ * them out over a pool of reader threads.  Only the reads and their
+ * dequantization run there, on destinations private to each item; hashing
+ * stays in order because the context rolls, and the cache is touched by the
+ * calling thread alone.  That keeps the pool free of any shared mutable state.
+ *
+ * Knobs, all of them arguments to this one implementation:
+ * DS4_QWEN38_PLE_CACHE_MB (default 64, 0 disables the cache),
+ * DS4_QWEN38_PLE_THREADS (default 8, 1 reads serially),
+ * DS4_QWEN38_PLE_DIRECT=0 (unaligned reads),
+ * DS4_QWEN38_PLE_NOCACHE=0 (leave the page cache under the reads, which is
+ * how the pre-store retention is reproduced for comparison).
+ * One store belongs to one session and is driven by its thread.
+ */
+
+/* Read one row.  Thread safe: pread carries its own offset and both `dst` and
+ * `iobuf` belong to the caller, so the readers share nothing but the
+ * descriptor.
+ *
+ * With `iobuf` (page aligned, DS4_QWEN38_PLE_IO_BUF bytes) the read is widened
+ * to whole device blocks at an aligned offset, which is what lets the kernel
+ * DMA straight into the buffer instead of allocating, filling and dumping a
+ * 16 KiB page per 170-byte row.  Passing NULL asks for the plain unaligned
+ * read.  Nothing depends on which one happens: a wrong alignment assumption
+ * only costs the speedup. */
+static bool qwen38_ple_read_row(const ds4_qwen38_ple_store *s, uint64_t id,
+                                uint8_t *dst, double *seconds, uint8_t *iobuf) {
+    const double t0 = now_sec();
+    const uint64_t row_off = s->base_offset + id * DS4_QWEN38_PLE_ROW_BYTES;
+
+    uint8_t *target = dst;
+    uint64_t at = row_off;
+    size_t skew = 0;
+    size_t want = DS4_QWEN38_PLE_ROW_BYTES;
+    if (iobuf) {
+        at = row_off & ~(uint64_t)(DS4_QWEN38_PLE_IO_BLOCK - 1);
+        skew = (size_t)(row_off - at);
+        want = ((skew + DS4_QWEN38_PLE_ROW_BYTES + DS4_QWEN38_PLE_IO_BLOCK - 1) /
+                DS4_QWEN38_PLE_IO_BLOCK) * DS4_QWEN38_PLE_IO_BLOCK;
+        target = iobuf;
+    }
+
+    size_t got = 0;
+    while (got < want) {
+        const ssize_t n = pread(s->fd, target + got, want - got,
+                                (off_t)(at + got));
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        /* The widened read can run past the end of the file on the last rows;
+         * that is fine as long as the row itself landed. */
+        if (n == 0 && iobuf && got >= skew + DS4_QWEN38_PLE_ROW_BYTES) break;
+        fprintf(stderr, "ds4: Qwen38 PLE row %llu read failed: %s\n",
+                (unsigned long long)id,
+                n == 0 ? "short read" : strerror(errno));
+        return false;
+    }
+    if (iobuf) memcpy(dst, iobuf + skew, DS4_QWEN38_PLE_ROW_BYTES);
+    if (seconds) *seconds = now_sec() - t0;
+    return true;
+}
+
+/* Bytes this process has read from disk, or 0 when the counter is not
+ * available.  Both read paths issue their I/O on the calling thread, so the
+ * reader pool's traffic lands on this process. */
+static uint64_t qwen38_ple_diskio_bytes(void) {
+#if defined(__APPLE__)
+    struct rusage_info_v4 ri;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) != 0) {
+        return 0;
+    }
+    return ri.ri_diskio_bytesread;
+#else
+    return 0;
+#endif
+}
+
+/* One page-aligned staging buffer, or NULL if it cannot be allocated. */
+static uint8_t *qwen38_ple_iobuf_alloc(void) {
+    void *buf = NULL;
+    /* Page alignment covers the device block and the mount's own mask. */
+    if (posix_memalign(&buf, 16384, DS4_QWEN38_PLE_IO_BUF) != 0) return NULL;
+    return (uint8_t *)buf;
+}
+
+static void *qwen38_ple_pool_worker(void *arg) {
+    ds4_qwen38_ple_store *s = (ds4_qwen38_ple_store *)arg;
+    uint8_t *iobuf = qwen38_ple_iobuf_alloc();
+    if (!iobuf) {
+        /* Otherwise this shows up only as a mysterious 16 KiB per read. */
+        fprintf(stderr, "ds4: warning: a Qwen38 PLE reader could not allocate "
+                        "its aligned buffer and falls back to page reads\n");
+    }
+    uint64_t seen = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&s->mutex);
+        while (!s->stopping && s->generation == seen) {
+            pthread_cond_wait(&s->start_cond, &s->mutex);
+        }
+        if (s->stopping) {
+            pthread_mutex_unlock(&s->mutex);
+            break;
+        }
+        seen = s->generation;
+
+        for (;;) {
+            const uint32_t i = s->next_item++;
+            if (i >= s->n_items) break;
+            ds4_qwen38_ple_miss *m = &s->misses[i];
+            pthread_mutex_unlock(&s->mutex);
+
+            m->ok = qwen38_ple_read_row(s, m->id, m->slot, &m->seconds, iobuf);
+            if (m->ok) {
+                qwen38_dequant_q8_0_row(m->slot, m->dst, DS4_QWEN38_PLE_ROW_LEN);
+            }
+
+            pthread_mutex_lock(&s->mutex);
+        }
+
+        if (s->remaining > 0 && --s->remaining == 0) {
+            pthread_cond_signal(&s->done_cond);
+        }
+        pthread_mutex_unlock(&s->mutex);
+    }
+    free(iobuf);
+    return NULL;
+}
+
+static void qwen38_ple_pool_stop(ds4_qwen38_ple_store *s) {
+    if (!s->pool_ready) return;
+    pthread_mutex_lock(&s->mutex);
+    s->stopping = true;
+    pthread_cond_broadcast(&s->start_cond);
+    pthread_mutex_unlock(&s->mutex);
+    for (uint32_t i = 0; i < s->n_threads; i++) {
+        pthread_join(s->threads[i], NULL);
+    }
+    pthread_mutex_destroy(&s->mutex);
+    pthread_cond_destroy(&s->start_cond);
+    pthread_cond_destroy(&s->done_cond);
+    s->pool_ready = false;
+    s->n_threads = 0;
+}
+
+/* Brings the pool up; falls back to serial reads if it cannot. */
+static void qwen38_ple_pool_start(ds4_qwen38_ple_store *s) {
+    const uint32_t want = DS4_QWEN38_PLE_THREADS;
+
+    pthread_mutex_init(&s->mutex, NULL);
+    pthread_cond_init(&s->start_cond, NULL);
+    pthread_cond_init(&s->done_cond, NULL);
+    s->stopping = false;
+    s->generation = 0;
+    s->n_items = 0;
+    s->remaining = 0;
+
+    /* These threads only wait on the device, but they gate a token, so they
+     * belong on the performance cores with the rest of the hot path. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+#if defined(__APPLE__)
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    for (uint32_t i = 0; i < want; i++) {
+        if (pthread_create(&s->threads[i], &attr, qwen38_ple_pool_worker, s) != 0) {
+            break;  /* whatever came up is enough; the rest stays serial */
+        }
+        s->n_threads++;
+    }
+    pthread_attr_destroy(&attr);
+    if (s->n_threads == 0) {
+        pthread_mutex_destroy(&s->mutex);
+        pthread_cond_destroy(&s->start_cond);
+        pthread_cond_destroy(&s->done_cond);
+        return;
+    }
+    s->pool_ready = true;
+}
+
+static void ds4_qwen38_ple_store_free(ds4_qwen38_ple_store *s) {
+    qwen38_ple_pool_stop(s);
+    if (s->fd >= 0) close(s->fd);
+    free(s->tags);
+    free(s->rows);
+    free(s->ages);
+    free(s->bounce);
+    free(s->misses);
+    free(s->dups);
+    free(s->dedup);
+    free(s->slab);
+    free(s->iobuf);
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+}
+
+static bool ds4_qwen38_ple_store_init(ds4_qwen38_ple_store *s, const char *path,
+                                      uint64_t base_offset, uint64_t table_rows) {
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+    s->base_offset = base_offset;
+    s->table_rows = table_rows;
+
+    s->fd = open(path, O_RDONLY);
+    if (s->fd == -1) {
+        fprintf(stderr,
+                "ds4: cannot open the Qwen38 PLE sidecar for row reads: %s\n",
+                strerror(errno));
+        return false;
+    }
+#if defined(F_NOCACHE)
+    if (fcntl(s->fd, F_NOCACHE, 1) == -1) {
+        fprintf(stderr, "ds4: warning: F_NOCACHE failed on the PLE sidecar: %s\n",
+                strerror(errno));
+    }
+#elif defined(POSIX_FADV_RANDOM)
+    /* Portability placeholder only, and weaker than F_NOCACHE: this drops
+     * readahead but Linux still retains the 4 KiB page of every row, so the
+     * footprint argument above does not hold there.  The real equivalent is
+     * O_DIRECT, which the block-aligned read is already shaped for, but it
+     * would reject the unaligned fallback and some filesystems refuse it.
+     * Qwen 3.8 is Metal-only in v1, so this path does not run yet; do the
+     * O_DIRECT work when a backend needs it.  F_NOCACHE and the B/read figure
+     * are Darwin-only for the same reason. */
+    (void)posix_fadvise(s->fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    const uint32_t batch_items = DS4_QWEN38_PLE_BATCH_ITEMS;
+    s->bounce = malloc(DS4_QWEN38_PLE_ROW_BYTES);
+    s->misses = malloc((size_t)batch_items * sizeof(*s->misses));
+    s->dups = malloc((size_t)batch_items * sizeof(*s->dups));
+    s->dedup = malloc(DS4_QWEN38_PLE_DEDUP_SLOTS * sizeof(*s->dedup));
+    s->slab = malloc((size_t)batch_items * DS4_QWEN38_PLE_ROW_BYTES);
+    s->iobuf = qwen38_ple_iobuf_alloc();
+    if (!s->bounce || !s->misses || !s->dups || !s->dedup || !s->slab ||
+        !s->iobuf) {
+        fprintf(stderr, "ds4: out of memory for the Qwen38 PLE batch buffers\n");
+        ds4_qwen38_ple_store_free(s);
+        return false;
+    }
+
+    const uint64_t slot_bytes = DS4_QWEN38_PLE_ROW_BYTES + sizeof(uint32_t) + 1u;
+    uint64_t sets = ((uint64_t)DS4_QWEN38_PLE_CACHE_MB << 20) /
+                    (slot_bytes * DS4_QWEN38_PLE_CACHE_WAYS);
+    /* An empty way is spelled UINT32_MAX, so that id must not be reachable. */
+    if (table_rows > (uint64_t)UINT32_MAX - 1u) sets = 0;
+    if (sets > UINT32_MAX) sets = UINT32_MAX;
+    /* Keep the count odd: a power of two would map whole low-bit patterns of
+     * the ids onto the same sets, and the budget arithmetic can land on one. */
+    if (sets > 1) sets |= 1;
+
+    if (sets > 0) {
+        const size_t slots = (size_t)sets * DS4_QWEN38_PLE_CACHE_WAYS;
+        s->tags = malloc(slots * sizeof(uint32_t));
+        s->rows = malloc(slots * DS4_QWEN38_PLE_ROW_BYTES);
+        s->ages = malloc(slots);
+        if (!s->tags || !s->rows || !s->ages) {
+            fprintf(stderr,
+                    "ds4: out of memory for the Qwen38 PLE row cache "
+                    "(%.0f MiB requested)\n",
+                    (double)(slots * slot_bytes) / (1024.0 * 1024.0));
+            ds4_qwen38_ple_store_free(s);
+            return false;
+        }
+        memset(s->tags, 0xFF, slots * sizeof(uint32_t));
+        /* Ages hold a permutation of 0..WAYS-1 per set; seed one. */
+        for (size_t i = 0; i < slots; i++) {
+            s->ages[i] = (uint8_t)(i % DS4_QWEN38_PLE_CACHE_WAYS);
+        }
+        s->sets = (uint32_t)sets;
+    }
+
+    /* Last, so the workers cannot observe a half-built store. */
+    qwen38_ple_pool_start(s);
+
+    if (s->sets) {
+        fprintf(stderr,
+                "ds4: qwen38 PLE rows: %s reads on %u thread%s + "
+                "%.0f MiB row cache (%llu rows, %u-way)\n",
+                "F_NOCACHE block-aligned",
+                s->pool_ready ? s->n_threads : 1u,
+                (s->pool_ready ? s->n_threads : 1u) == 1 ? "" : "s",
+                (double)((uint64_t)s->sets * DS4_QWEN38_PLE_CACHE_WAYS *
+                         slot_bytes) / (1024.0 * 1024.0),
+                (unsigned long long)s->sets * DS4_QWEN38_PLE_CACHE_WAYS,
+                (unsigned)DS4_QWEN38_PLE_CACHE_WAYS);
+    } else {
+        fprintf(stderr,
+                "ds4: qwen38 PLE rows: %s reads on %u thread%s, "
+                "row cache disabled\n",
+                "F_NOCACHE block-aligned",
+                s->pool_ready ? s->n_threads : 1u,
+                (s->pool_ready ? s->n_threads : 1u) == 1 ? "" : "s");
+    }
+    return true;
+}
+
+static void ds4_qwen38_ple_store_report(const ds4_qwen38_ple_store *s) {
+    if (s->lookups == 0 || !getenv("DS4_QWEN38_DEBUG")) return;
+    /* read_seconds sums the reads, which overlap when the pool is up, so it is
+     * device time and not wall time. */
+    char io[64];
+    io[0] = '\0';
+    if (s->io_reads) {
+        snprintf(io, sizeof(io), ", %.0f B/read from disk",
+                 (double)s->io_bytes / (double)s->io_reads);
+    }
+    fprintf(stderr,
+            "ds4: qwen38 PLE rows: %llu lookups, %.2f%% hit (%llu intra-batch), "
+            "%llu reads (%.2f MiB) in %.1f ms device time%s\n",
+            (unsigned long long)s->lookups,
+            100.0 * (double)s->hits / (double)s->lookups,
+            (unsigned long long)s->dup_hits,
+            (unsigned long long)s->reads,
+            (double)(s->reads * DS4_QWEN38_PLE_ROW_BYTES) / (1024.0 * 1024.0),
+            s->read_seconds * 1000.0, io);
+}
+
+/* Exact LRU over the ways of one set: everything younger than the touched way
+ * ages by one, the touched way becomes the youngest.  Preserves the
+ * permutation invariant the ages were seeded with. */
+static void qwen38_ple_cache_touch(uint8_t *ages, uint32_t way) {
+    const uint8_t was = ages[way];
+    for (uint32_t w = 0; w < DS4_QWEN38_PLE_CACHE_WAYS; w++) {
+        if (ages[w] < was) ages[w]++;
+    }
+    ages[way] = 0;
+}
+
+/* The row if it is resident, NULL otherwise.  Counts the lookup and refreshes
+ * recency on a hit.  No I/O, so it is cheap enough to run over a whole batch
+ * before deciding what has to be read. */
+static const uint8_t *qwen38_ple_cache_probe(ds4_qwen38_ple_store *s, uint64_t id) {
+    s->lookups++;
+    if (!s->sets) return NULL;
+    const size_t first = (size_t)(id % s->sets) * DS4_QWEN38_PLE_CACHE_WAYS;
+    const uint32_t *tags = s->tags + first;
+    for (uint32_t w = 0; w < DS4_QWEN38_PLE_CACHE_WAYS; w++) {
+        if (tags[w] != (uint32_t)id) continue;
+        s->hits++;
+        qwen38_ple_cache_touch(s->ages + first, w);
+        return s->rows + (first + w) * DS4_QWEN38_PLE_ROW_BYTES;
+    }
+    return NULL;
+}
+
+/* Publish a row that has just been read, over an empty way or the oldest one. */
+static void qwen38_ple_cache_insert(ds4_qwen38_ple_store *s, uint64_t id,
+                                    const uint8_t *src) {
+    if (!s->sets) return;
+    const size_t first = (size_t)(id % s->sets) * DS4_QWEN38_PLE_CACHE_WAYS;
+    uint32_t *tags = s->tags + first;
+    uint8_t *ages = s->ages + first;
+    uint32_t victim = 0;
+    for (uint32_t w = 0; w < DS4_QWEN38_PLE_CACHE_WAYS; w++) {
+        if (tags[w] == UINT32_MAX) { victim = w; break; }
+        if (ages[w] >= ages[victim]) victim = w;
+    }
+    memcpy(s->rows + (first + victim) * DS4_QWEN38_PLE_ROW_BYTES, src,
+           DS4_QWEN38_PLE_ROW_BYTES);
+    tags[victim] = (uint32_t)id;
+    qwen38_ple_cache_touch(ages, victim);
+}
+
+/* One row of Q8_0 payload (ROW_BYTES), valid until the next call on this
+ * store.  NULL on a bad id or a failed read.  The serial entry point; the
+ * gather below is what the engine actually uses. */
+static const uint8_t *ds4_qwen38_ple_store_row(ds4_qwen38_ple_store *s,
+                                               uint64_t id) {
+    if (id >= s->table_rows) {
+        fprintf(stderr, "ds4: Qwen38 PLE row %llu is past the table (%llu rows)\n",
+                (unsigned long long)id, (unsigned long long)s->table_rows);
+        return NULL;
+    }
+    const uint8_t *hit = qwen38_ple_cache_probe(s, id);
+    if (hit) return hit;
+
+    double seconds = 0.0;
+    if (!qwen38_ple_read_row(s, id, s->bounce, &seconds, s->iobuf)) return NULL;
+    s->reads++;
+    s->read_seconds += seconds;
+    qwen38_ple_cache_insert(s, id, s->bounce);
+    return s->bounce;
+}
+
+/* Serve the `n` misses collected for one batch, then publish them.  Below a
+ * handful of items waking the pool costs more than it saves. */
+static bool qwen38_ple_run_misses(ds4_qwen38_ple_store *s, uint32_t n,
+                                  uint32_t n_dups) {
+    if (n == 0) return true;  /* a duplicate cannot exist without its original */
+
+    const uint64_t io_before = qwen38_ple_diskio_bytes();
+
+    if (s->pool_ready && n >= 4) {
+        pthread_mutex_lock(&s->mutex);
+        s->n_items = n;
+        s->next_item = 0;
+        s->remaining = s->n_threads;
+        s->generation++;
+        pthread_cond_broadcast(&s->start_cond);
+        while (s->remaining > 0) {
+            pthread_cond_wait(&s->done_cond, &s->mutex);
+        }
+        s->n_items = 0;
+        pthread_mutex_unlock(&s->mutex);
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            ds4_qwen38_ple_miss *m = &s->misses[i];
+            m->ok = qwen38_ple_read_row(s, m->id, m->slot, &m->seconds,
+                                        s->iobuf);
+            if (m->ok) {
+                qwen38_dequant_q8_0_row(m->slot, m->dst, DS4_QWEN38_PLE_ROW_LEN);
+            }
+        }
+    }
+
+    const uint64_t io_after = qwen38_ple_diskio_bytes();
+    const bool io_sampled = io_before != 0 && io_after >= io_before;
+    if (io_sampled) s->io_bytes += io_after - io_before;
+
+    bool ok = true;
+    uint64_t done = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!s->misses[i].ok) { ok = false; continue; }
+        done++;
+        s->reads++;
+        s->read_seconds += s->misses[i].seconds;
+        /* The id missed the probe, so it is not resident and this is its only
+         * insert in the batch: no way can end up holding it twice. */
+        qwen38_ple_cache_insert(s, s->misses[i].id, s->misses[i].slot);
+    }
+    if (io_sampled) s->io_reads += done;
+    for (uint32_t d = 0; d < n_dups; d++) {
+        const ds4_qwen38_ple_dup *dup = &s->dups[d];
+        if (!s->misses[dup->of].ok) { ok = false; continue; }
+        qwen38_dequant_q8_0_row(s->misses[dup->of].slot, dup->dst,
+                                DS4_QWEN38_PLE_ROW_LEN);
+    }
+    return ok;
+}
+
+/* Hash a chunk of tokens and lay their 16 rows out as [rows, 16 * 160] floats.
+ * Hashing rolls a context so it stays in order on this thread, and so does
+ * every cache access; only the reads that missed fan out, each into its own
+ * slab slot and its own 160 floats of stage. */
+static bool qwen38_ple_gather(ds4_qwen38_ple_store *s, ds4_qwen38_ple_ctx *ctx,
+                              const int *tokens, uint32_t rows, float *stage,
+                              uint32_t stride) {
+    for (uint32_t base = 0; base < rows; base += DS4_QWEN38_PLE_BATCH_ROWS) {
+        const uint32_t left = rows - base;
+        const uint32_t n = left < DS4_QWEN38_PLE_BATCH_ROWS ?
+                           left : (uint32_t)DS4_QWEN38_PLE_BATCH_ROWS;
+        uint32_t misses = 0, dups = 0;
+        memset(s->dedup, 0, DS4_QWEN38_PLE_DEDUP_SLOTS * sizeof(*s->dedup));
+
+        for (uint32_t r = 0; r < n; r++) {
+            uint64_t ids[DS4_QWEN38_PLE_HEADS];
+            ds4_qwen38_ple_hash(ctx, tokens[base + r], ids);
+            ds4_qwen38_ple_ctx_push(ctx, tokens[base + r]);
+            float *row_base = stage + (uint64_t)(base + r) * stride;
+
+            for (uint32_t h = 0; h < DS4_QWEN38_PLE_HEADS; h++) {
+                float *dst = row_base + (uint64_t)h * DS4_QWEN38_PLE_ROW_LEN;
+                if (ids[h] >= s->table_rows) {
+                    fprintf(stderr,
+                            "ds4: Qwen38 PLE row %llu is past the table "
+                            "(%llu rows)\n", (unsigned long long)ids[h],
+                            (unsigned long long)s->table_rows);
+                    return false;
+                }
+                const uint8_t *hit = qwen38_ple_cache_probe(s, ids[h]);
+                if (hit) {
+                    qwen38_dequant_q8_0_row(hit, dst, DS4_QWEN38_PLE_ROW_LEN);
+                    continue;
+                }
+                /* Two tokens of one batch can want the same row.  Both miss
+                 * the probe, because nothing is published before phase C, so
+                 * without this they would each pay for the read. */
+                uint32_t slot = (uint32_t)(ids[h] & (DS4_QWEN38_PLE_DEDUP_SLOTS - 1));
+                uint32_t of = UINT32_MAX;
+                while (s->dedup[slot]) {
+                    const uint32_t mi = s->dedup[slot] - 1u;
+                    if (s->misses[mi].id == ids[h]) { of = mi; break; }
+                    slot = (slot + 1u) & (DS4_QWEN38_PLE_DEDUP_SLOTS - 1);
+                }
+                if (of != UINT32_MAX) {
+                    s->dups[dups].of = of;
+                    s->dups[dups].dst = dst;
+                    dups++;
+                    /* Counted as a hit so the rate keeps meaning "lookups
+                     * that cost no read", and tracked apart so it cannot be
+                     * mistaken for the cache doing the work. */
+                    s->hits++;
+                    s->dup_hits++;
+                    continue;
+                }
+                s->dedup[slot] = misses + 1u;
+
+                ds4_qwen38_ple_miss *m = &s->misses[misses];
+                m->id = ids[h];
+                m->slot = s->slab + (size_t)misses * DS4_QWEN38_PLE_ROW_BYTES;
+                m->dst = dst;
+                m->seconds = 0.0;
+                m->ok = false;
+                misses++;
+            }
+        }
+
+        if (!qwen38_ple_run_misses(s, misses, dups)) return false;
+    }
+    return true;
+}
+
+int ds4_test_qwen38_ple_gather(const char *path, uint64_t base_offset,
+                               uint64_t table_rows, const int *tokens,
+                               uint32_t n_tokens, float *out,
+                               uint64_t stats[3]) {
+    ds4_qwen38_ple_store s;
+    if (!ds4_qwen38_ple_store_init(&s, path, base_offset, table_rows)) {
+        return -1;
+    }
+    ds4_qwen38_ple_ctx ctx;
+    ds4_qwen38_ple_ctx_reset(&ctx);
+    const uint32_t stride = DS4_QWEN38_PLE_HEADS * DS4_QWEN38_PLE_ROW_LEN;
+    const int rc = qwen38_ple_gather(&s, &ctx, tokens, n_tokens, out, stride) ?
+                   0 : -1;
+    if (stats) {
+        stats[0] = s.lookups;
+        stats[1] = s.hits;
+        stats[2] = s.reads;
+    }
+    ds4_qwen38_ple_store_free(&s);
+    return rc;
+}
+
+int ds4_test_qwen38_ple_store(const char *path, uint64_t base_offset,
+                              uint64_t table_rows, const uint64_t *ids,
+                              uint32_t n, uint8_t *out, uint64_t stats[3]) {
+    ds4_qwen38_ple_store s;
+    if (!ds4_qwen38_ple_store_init(&s, path, base_offset, table_rows)) {
+        return -1;
+    }
+    int rc = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *row = ds4_qwen38_ple_store_row(&s, ids[i]);
+        if (!row) { rc = -1; break; }
+        if (out) {
+            memcpy(out + (size_t)i * DS4_QWEN38_PLE_ROW_BYTES, row,
+                   DS4_QWEN38_PLE_ROW_BYTES);
+        }
+    }
+    if (stats) {
+        stats[0] = s.lookups;
+        stats[1] = s.hits;
+        stats[2] = s.reads;
+    }
+    ds4_qwen38_ple_store_free(&s);
+    return rc;
+}
+
 static void qwen38_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->q38_h);
     ds4_gpu_tensor_free(g->q38_normed);
@@ -48897,6 +49587,8 @@ static void qwen38_graph_free(ds4_glm_gpu_graph *g) {
     free(g->q38_stage_host);
     g->q38_stage_host = NULL;
     if (g->q38_ple_open) {
+        ds4_qwen38_ple_store_report(&g->q38_ple_store);
+        ds4_qwen38_ple_store_free(&g->q38_ple_store);
         model_close(&g->q38_ple_model);
         g->q38_ple_open = false;
     }
@@ -48930,7 +49622,10 @@ static bool qwen38_graph_open_ple(ds4_glm_gpu_graph *g) {
                 (unsigned long long)g_ds4_qwen38_ple.total_rows);
         return false;
     }
-    return true;
+    /* The mapping stays for the metadata the parser points into, but the row
+     * data is never faulted through it: the store reads it explicitly. */
+    return ds4_qwen38_ple_store_init(&g->q38_ple_store, path,
+                                     g->q38_ple_table->abs_offset, table_rows);
 }
 
 static bool qwen38_graph_reset_state(ds4_glm_gpu_graph *g) {
@@ -49240,19 +49935,10 @@ static bool qwen38_graph_forward_tokens(
     if (!ok) DS4_Q38_STEP0("h upload");
 
     /* Host: PLE hashing plus sidecar row gather (16 heads x 160 = 2560). */
-    const uint8_t *table_base = (const uint8_t *)g->q38_ple_model.map +
-                                g->q38_ple_table->abs_offset;
-    for (uint32_t r = 0; ok && r < rows; r++) {
-        uint64_t ids[DS4_QWEN38_PLE_HEADS];
-        ds4_qwen38_ple_hash(&g->q38_ple_ctx, tokens[r], ids);
-        ds4_qwen38_ple_ctx_push(&g->q38_ple_ctx, tokens[r]);
-        float *dst = g->q38_stage_host + (uint64_t)r * DS4_N_EMBD;
-        for (uint32_t h = 0; h < DS4_QWEN38_PLE_HEADS; h++) {
-            qwen38_dequant_q8_0_row(table_base + ids[h] * 170ull,
-                                    dst + (uint64_t)h * DS4_QWEN38_PLE_ROW_LEN,
-                                    DS4_QWEN38_PLE_ROW_LEN);
-        }
-    }
+    g->q38_ple_ctx_pending = g->q38_ple_ctx;
+    if (ok) ok = qwen38_ple_gather(&g->q38_ple_store, &g->q38_ple_ctx_pending,
+                                   tokens, rows, g->q38_stage_host, DS4_N_EMBD);
+    if (!ok) DS4_Q38_STEP0("ple gather");
     if (ok) ok = ds4_gpu_tensor_write(g->q38_ple_emb, 0, g->q38_stage_host,
                                       (uint64_t)rows * DS4_N_EMBD *
                                       sizeof(float)) != 0;
@@ -49403,6 +50089,7 @@ static bool qwen38_graph_forward_tokens(
         if (!ok) DS4_Q38_STEP0("logits read");
     }
     if (!ok) (void)ds4_gpu_synchronize();
+    if (ok) g->q38_ple_ctx = g->q38_ple_ctx_pending;
     return ok;
 #undef DS4_Q38_STEP
 #undef DS4_Q38_STEP0

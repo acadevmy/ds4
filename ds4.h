@@ -394,6 +394,23 @@ void ds4_qwen38_ple_test_config(const uint64_t multipliers[3],
                                 const uint64_t offsets[16],
                                 const uint64_t vocab_sizes[16],
                                 uint32_t eos_token_id);
+/* Test-only driver for the PLE row store (explicit reads plus the row cache
+ * that replaced faulting the 51 GiB sidecar through its mapping). Serves the
+ * `n` row ids from `path`, copying each 170-byte row into `out` (n * 170
+ * bytes, may be NULL) and reporting {lookups, hits, reads} in `stats`.
+ * Returns 0, or -1 if a row could not be served. */
+int ds4_test_qwen38_ple_store(const char *path, uint64_t base_offset,
+                              uint64_t table_rows, const uint64_t *ids,
+                              uint32_t n, uint8_t *out, uint64_t stats[3]);
+
+/* Test-only driver for the batched gather, the path the engine uses: hashes
+ * `n_tokens` through the rolling context and writes n_tokens * 2560 floats
+ * into `out`, fanning the reads that missed over the reader pool. The hash
+ * parameters come from ds4_qwen38_ple_test_config. */
+int ds4_test_qwen38_ple_gather(const char *path, uint64_t base_offset,
+                               uint64_t table_rows, const int *tokens,
+                               uint32_t n_tokens, float *out,
+                               uint64_t stats[3]);
 bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       int token,
